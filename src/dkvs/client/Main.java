@@ -15,7 +15,7 @@ import java.util.Scanner;
 public class Main {
     public static void main(String[] args) {
         Scanner sc = new Scanner(System.in);
-        Socket socket = null;
+        Socket socket;
         boolean connected = false;
         Scanner input = null;
         PrintWriter output = null;
@@ -38,6 +38,7 @@ public class Main {
                         connected = true;
                     } catch (IOException e) {
                         System.err.println("Error while connecting: " + e.getMessage());
+                        System.err.flush();
                     }
                     break;
                 case "exit":
@@ -111,6 +112,8 @@ public class Main {
                         System.out.println("Not connected!");
                     }
                     break;
+                default:
+                    System.out.println("Unrecognized command!");
             }
         }
     }

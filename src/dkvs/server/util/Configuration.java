@@ -31,7 +31,7 @@ public class Configuration {
             hosts = new String[totalNumber];
             ports = new int[totalNumber];
             for (int i = 0; i < totalNumber; i++) {
-                String s = get("node." + i, options);
+                String s = get("node." + (i + 1), options);
                 int p = s.indexOf(':');
                 if (p == -1) {
                     throw new ParseException("Error: Unrecognized option: " + s);

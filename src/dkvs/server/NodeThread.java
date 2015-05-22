@@ -16,29 +16,27 @@ import java.io.FileNotFoundException;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.net.InetSocketAddress;
-import java.util.*;
+import java.util.ArrayDeque;
+import java.util.List;
+import java.util.Queue;
+import java.util.Scanner;
 
 public class NodeThread extends Thread {
     private final Configuration configuration;
     private final ConnectionManager manager;
     private final Queue<Message> queue = new ArrayDeque<>();
-    private final Map<Integer, ClientServerRequest> requests = new HashMap<>();
+
+    private final RSM rsm;
     private final State state;
-    private final int[] nextIndex, matchIndex;
-    private long lastMessageTime;
-    private int voteCount;
+
     private volatile boolean isStopped;
-    private int leader = -1;
 
     public NodeThread(Configuration configuration) throws IOException {
         this.configuration = configuration;
         manager = new ConnectionManager(configuration, this);
-        state = new State(configuration.number);
-        nextIndex = new int[configuration.totalNumber];
-        for (int i = 0; i < nextIndex.length; i++) {
-            nextIndex[i] = state.log.size();
-        }
-        matchIndex = new int[configuration.totalNumber];
+        rsm = new RSM(configuration);
+        state = new State();
+        state.commitNext = rsm.size();
     }
 
     public void add(Message message) {
@@ -54,7 +52,7 @@ public class NodeThread extends Thread {
             synchronized (queue) {
                 if (!queue.isEmpty()) {
                     return queue.poll();
-                } else if (System.currentTimeMillis() - lastMessageTime > timeout) {
+                } else if (System.currentTimeMillis() - state.lastMessageTime > timeout) {
                     return null;
                 } else {
                     new Thread(() -> {
@@ -79,7 +77,7 @@ public class NodeThread extends Thread {
     @Override
     public void run() {
         manager.start();
-        lastMessageTime = System.currentTimeMillis();
+        state.lastMessageTime = System.currentTimeMillis();
         while (!isStopped) {
             try {
                 Message message = getMessage();
@@ -89,7 +87,11 @@ public class NodeThread extends Thread {
                     processMessage(message);
                 }
             } catch (InterruptedException | IOException e) {
-                close();
+                try {
+                    close();
+                } catch (IOException e1) {
+                    System.err.println("Error while closing RSM.");
+                }
                 return;
             }
         }
@@ -117,27 +119,26 @@ public class NodeThread extends Thread {
     private void processClientServerRequest(ClientServerRequest request) throws IOException {
         switch (request.operation) {
             case PING:
-                manager.send(getStatus(), new ClientServerResponse(request.address, Operation.PING, true, null, request.redirections));
+                sendVerbose(new ClientServerResponse(request.address, Operation.PING, true, null, request.redirections));
                 return;
             case GET:
-                manager.send(getStatus(), new ClientServerResponse(request.address, Operation.GET,
-                        state.data.containsKey(request.key), state.data.get(request.key), request.redirections));
+                sendVerbose(new ClientServerResponse(request.address, Operation.GET,
+                        rsm.containsKey(request.key), rsm.get(request.key), request.redirections));
                 return;
             case SET:
             case DELETE:
                 if (state.state == 2) {
-                    state.add(new Entry[]{new Entry(state.term, request.operation, request.key, request.value)});
-                    requests.put(state.log.size() - 1, request);
+                    rsm.add(new Entry(state.term, request.operation, request.key, request.value), request);
                     checkCommit();
                     processTimeout();
-                } else if (leader != -1) {
+                } else if (state.leader != -1) {
                     ClientServerRequest r = new ClientServerRequest(
-                            new InetSocketAddress(configuration.hosts[leader], configuration.ports[leader]),
+                            new InetSocketAddress(configuration.hosts[state.leader], configuration.ports[state.leader]),
                             request.operation, request.key, request.value, request.redirections);
                     r.redirections.add((InetSocketAddress) request.address);
-                    manager.send(getStatus(), r);
+                    sendVerbose(r);
                 } else {
-                    manager.send(getStatus(), new ClientServerResponse(request.address, request.operation, false, "Unknown leader", request.redirections));
+                    sendVerbose(new ClientServerResponse(request.address, request.operation, false, "Unknown leader", request.redirections));
                 }
         }
     }
@@ -146,7 +147,7 @@ public class NodeThread extends Thread {
         ClientServerResponse r = new ClientServerResponse(response.redirections.get(response.redirections.size() - 1),
                 response.operation, response.success, response.result, response.redirections);
         r.redirections.remove(r.redirections.size() - 1);
-        manager.send(getStatus(), r);
+        sendVerbose(r);
     }
 
     private void processAppendEntriesRPC(AppendEntriesRPC rpc) throws IOException {
@@ -156,35 +157,35 @@ public class NodeThread extends Thread {
             }
             state.setTerm(rpc.term);
             state.state = 0;
-            lastMessageTime = System.currentTimeMillis();
-            leader = rpc.leaderId;
+            state.lastMessageTime = System.currentTimeMillis();
+            state.leader = rpc.leaderId;
         }
         if (state.term == rpc.term && (rpc.prevLogIndex == -1
-                || state.log.size() > rpc.prevLogIndex && state.log.get(rpc.prevLogIndex).term == rpc.prevLogTerm)) {
-            state.remove(rpc.prevLogIndex);
-            state.add(rpc.log);
+                || rsm.size() > rpc.prevLogIndex && rsm.get(rpc.prevLogIndex).term == rpc.prevLogTerm)) {
+            rsm.remove(rpc.prevLogIndex);
+            rsm.add(rpc.log);
             if (rpc.leaderCommit > state.commitNext) {
-                state.setCommitNext(Math.min(rpc.leaderCommit, state.log.size()));
+                commit(Math.min(rpc.leaderCommit, rsm.size()));
             }
-            manager.send(getStatus(), new AppendEntriesResult(rpc.address, state.term, true, state.log.size(), configuration.number));
+            sendVerbose(new AppendEntriesResult(rpc.address, state.term, true, rsm.size(), configuration.number));
         } else {
-            manager.send(getStatus(), new AppendEntriesResult(rpc.address, state.term, false, state.log.size(), configuration.number));
+            sendVerbose(new AppendEntriesResult(rpc.address, state.term, false, rsm.size(), configuration.number));
         }
     }
 
     private void processAppendEntriesResult(AppendEntriesResult result) throws IOException {
         if (result.success) {
-            nextIndex[result.id] = result.currentLength;
-            matchIndex[result.id] = result.currentLength;
+            state.nextIndex[result.id] = result.currentLength;
+            state.matchIndex[result.id] = result.currentLength;
             checkCommit();
         } else {
-            nextIndex[result.id]--;
+            state.nextIndex[result.id]--;
         }
     }
 
     private void processRequestVoteRPC(RequestVoteRPC rpc) throws IOException {
         if (rpc.term < state.term) {
-            manager.send(getStatus(), new RequestVoteResult(rpc.address, state.term, false));
+            sendVerbose(new RequestVoteResult(rpc.address, state.term, false));
         } else {
             if (rpc.term > state.term) {
                 if (state.state != 0) {
@@ -194,13 +195,13 @@ public class NodeThread extends Thread {
                 state.setVotedFor(-1);
                 state.state = 0;
             }
-            int llt = state.log.size() == 0 ? -2 : state.log.get(state.log.size() - 1).term;
-            boolean upd = rpc.lastLogTerm > llt || rpc.lastLogTerm == llt && rpc.lastLogIndex >= state.log.size() - 1;
+            int llt = rsm.size() == 0 ? -2 : rsm.get(rsm.size() - 1).term;
+            boolean upd = rpc.lastLogTerm > llt || rpc.lastLogTerm == llt && rpc.lastLogIndex >= rsm.size() - 1;
             if (upd && (state.votedFor == -1 || state.votedFor == rpc.candidateId)) {
                 state.setVotedFor(rpc.candidateId);
-                manager.send(getStatus(), new RequestVoteResult(rpc.address, state.term, true));
+                sendVerbose(new RequestVoteResult(rpc.address, state.term, true));
             } else {
-                manager.send(getStatus(), new RequestVoteResult(rpc.address, state.term, false));
+                sendVerbose(new RequestVoteResult(rpc.address, state.term, false));
             }
         }
     }
@@ -208,13 +209,13 @@ public class NodeThread extends Thread {
     private void processRequestVoteResult(RequestVoteResult result) throws IOException {
         if (state.state == 1) {
             if (result.term == state.term && result.voteGranted) {
-                voteCount++;
-                if (voteCount > configuration.totalNumber / 2) {
+                state.voteCount++;
+                if (state.voteCount > configuration.totalNumber / 2) {
                     System.out.println("Converting to leader.");
                     state.state = 2;
-                    for (int i = 0; i < nextIndex.length; i++) {
-                        nextIndex[i] = state.log.size();
-                        matchIndex[i] = 0;
+                    for (int i = 0; i < state.nextIndex.length; i++) {
+                        state.nextIndex[i] = rsm.size();
+                        state.matchIndex[i] = 0;
                     }
                     processTimeout();
                 }
@@ -231,14 +232,14 @@ public class NodeThread extends Thread {
         if (state.state == 2) {
             for (int i = 0; i < configuration.totalNumber; i++) {
                 if (i != configuration.number) {
-                    Entry[] entries = new Entry[state.log.size() - nextIndex[i]];
+                    Entry[] entries = new Entry[rsm.size() - state.nextIndex[i]];
                     for (int j = 0; j < entries.length; j++) {
-                        entries[j] = state.log.get(nextIndex[i] + j);
+                        entries[j] = rsm.get(state.nextIndex[i] + j);
                     }
-                    manager.send(getStatus(), new AppendEntriesRPC(
+                    sendVerbose(new AppendEntriesRPC(
                             new InetSocketAddress(configuration.hosts[i], configuration.ports[i]),
-                            state.term, configuration.number, nextIndex[i] - 1,
-                            nextIndex[i] == 0 ? -1 : state.log.get(nextIndex[i] - 1).term,
+                            state.term, configuration.number, state.nextIndex[i] - 1,
+                            state.nextIndex[i] == 0 ? -1 : rsm.get(state.nextIndex[i] - 1).term,
                             state.commitNext, entries));
                 }
             }
@@ -246,39 +247,39 @@ public class NodeThread extends Thread {
             if (state.state != 1) {
                 System.out.println("Converting to candidate.");
             }
-            leader = -1;
+            state.leader = -1;
             state.setTerm(state.term + 1);
             state.state = 1;
             state.setVotedFor(configuration.number);
-            voteCount = 1;
+            state.voteCount = 1;
             if (configuration.totalNumber == 1) {
                 state.state = 2;
-                nextIndex[0] = state.log.size();
-                matchIndex[0] = 0;
+                state.nextIndex[0] = rsm.size();
+                state.matchIndex[0] = 0;
                 System.out.println("Converting to leader.");
             }
             for (int i = 0; i < configuration.totalNumber; i++) {
                 if (i != configuration.number) {
-                    manager.send(getStatus(), new RequestVoteRPC(
+                    sendVerbose(new RequestVoteRPC(
                             new InetSocketAddress(configuration.hosts[i], configuration.ports[i]),
-                            state.term, configuration.number, state.log.size() - 1,
-                            state.log.size() == 0 ? -1 : state.log.get(state.log.size() - 1).term));
+                            state.term, configuration.number, rsm.size() - 1,
+                            rsm.size() == 0 ? -1 : rsm.get(rsm.size() - 1).term));
                 }
             }
         }
-        lastMessageTime = System.currentTimeMillis();
+        state.lastMessageTime = System.currentTimeMillis();
     }
 
     private void checkCommit() throws IOException {
-        for (int i = state.commitNext; i < state.log.size(); i++) {
+        for (int i = state.commitNext; i < rsm.size(); i++) {
             int num = 1;
             for (int j = 0; j < configuration.totalNumber; j++) {
-                if (configuration.number != j && matchIndex[j] > i) {
+                if (configuration.number != j && state.matchIndex[j] > i) {
                     num++;
                 }
             }
-            if (num > configuration.totalNumber / 2 && state.log.get(i).term == state.term) {
-                state.setCommitNext(i + 1);
+            if (num > configuration.totalNumber / 2 && rsm.get(i).term == state.term) {
+                commit(i + 1);
             }
         }
     }
@@ -287,14 +288,21 @@ public class NodeThread extends Thread {
         return state.state == 2 ? configuration.timeout / 2 : configuration.timeout;
     }
 
-    public void close() {
+    public void close() throws IOException {
         isStopped = true;
         manager.close();
-        try {
-            state.close();
-        } catch (IOException e) {
-        }
+        rsm.close();
         interrupt();
+    }
+
+    private void commit(int commitNext) throws IOException {
+        List<ClientServerResponse> responses = state.commit(commitNext);
+        responses.forEach(this::sendVerbose);
+    }
+
+    private void sendVerbose(Message message) {
+        System.out.println(getStatus() + " Sending message (" + message.address + "): " + message.prettyPrint());
+        manager.send(message);
     }
 
     private String getStatus() {
@@ -303,22 +311,23 @@ public class NodeThread extends Thread {
     }
 
     private class State {
-        public final int number;
-        public final Map<String, String> data = new HashMap<>();
-        public final List<Entry> log = new ArrayList<>();
-        public final FileWriter writer;
+        final int[] nextIndex, matchIndex;
+        int state;
+        int commitNext;
+        int term, votedFor;
+        long lastMessageTime;
+        int voteCount;
+        int leader = -1;
 
-        public int state;
+        private String stateFile;
 
-        public int commitNext;
-
-        public int term, votedFor;
-
-        public State(int number) throws IOException {
-            this.number = number;
-            String logFile = "dkvs_" + number + ".log";
-            writer = new FileWriter(logFile, true);
-            readLog(logFile);
+        public State() throws IOException {
+            nextIndex = new int[configuration.totalNumber];
+            for (int i = 0; i < nextIndex.length; i++) {
+                nextIndex[i] = rsm.size();
+            }
+            matchIndex = new int[configuration.totalNumber];
+            stateFile = ".state_" + (configuration.number + 1);
             readState();
         }
 
@@ -332,44 +341,15 @@ public class NodeThread extends Thread {
             writeState();
         }
 
-        public void add(Entry[] entries) {
-            Collections.addAll(log, entries);
-        }
-
-        public void remove(int last) {
-            for (int i = last + 1; i < log.size(); i++) {
-                requests.remove(i);
-            }
-            while (log.size() > last + 1) {
-                log.remove(log.size() - 1);
-            }
-        }
-
-        public void setCommitNext(int commitNext) throws IOException {
-            for (int i = this.commitNext; i < commitNext; i++) {
-                applyEntry(i);
-                writer.write(log.get(i) + "\n");
-            }
-            writer.flush();
+        public List<ClientServerResponse> commit(int commitNext) throws IOException {
+            List<ClientServerResponse> responses = rsm.commit(this.commitNext, commitNext);
             this.commitNext = commitNext;
-        }
-
-        private void readLog(String fileName) {
-            try {
-                Scanner sc = new Scanner(new File(fileName));
-                while (sc.hasNext()) {
-                    log.add(Entry.parseEntry(sc));
-                    applyEntry(log.size() - 1);
-                }
-                commitNext = log.size();
-                sc.close();
-            } catch (FileNotFoundException e) {
-            }
+            return responses;
         }
 
         private void readState() {
             try {
-                Scanner sc = new Scanner(new File(getStateFileName()));
+                Scanner sc = new Scanner(new File(stateFile));
                 term = sc.nextInt();
                 votedFor = sc.nextInt();
                 sc.close();
@@ -379,34 +359,8 @@ public class NodeThread extends Thread {
         }
 
         private void writeState() throws IOException {
-            FileWriter writer = new FileWriter(getStateFileName());
+            FileWriter writer = new FileWriter(stateFile);
             writer.write(term + " " + votedFor);
-            writer.close();
-        }
-
-        private void applyEntry(int number) {
-            Entry entry = log.get(number);
-            if (entry.operation.equals(Operation.SET)) {
-                data.put(entry.key, entry.value);
-                if (requests.containsKey(number)) {
-                    manager.send(getStatus(), new ClientServerResponse(requests.get(number).address, requests.get(number).operation,
-                            true, null, requests.get(number).redirections));
-                }
-            } else if (entry.operation.equals(Operation.DELETE)) {
-                boolean success = data.containsKey(entry.key);
-                data.remove(entry.key);
-                if (requests.containsKey(number)) {
-                    manager.send(getStatus(), new ClientServerResponse(requests.get(number).address, requests.get(number).operation,
-                            success, null, requests.get(number).redirections));
-                }
-            }
-        }
-
-        private String getStateFileName() {
-            return ".state_" + number;
-        }
-
-        public void close() throws IOException {
             writer.close();
         }
     }

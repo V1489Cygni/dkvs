@@ -40,8 +40,7 @@ public class ConnectionManager extends Thread {
         }
     }
 
-    public void send(String status, Message message) {
-        System.out.println(status + " Sending message (" + message.address + "): " + message.prettyPrint());
+    public void send(Message message) {
         synchronized (connections) {
             SocketAddress address = message.address;
             if (!connections.containsKey(address) || connections.get(address).isClosed()) {

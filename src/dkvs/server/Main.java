@@ -13,7 +13,7 @@ public class Main {
             System.err.println("Error: Unexpected number of arguments!");
         } else {
             try {
-                Configuration configuration = new Configuration("dkvs.properties", Integer.parseInt(args[0]));
+                Configuration configuration = new Configuration("dkvs.properties", Integer.parseInt(args[0]) - 1);
                 NodeThread thread = new NodeThread(configuration);
                 thread.start();
             } catch (NumberFormatException e) {

@@ -4,6 +4,7 @@ import dkvs.server.messages.Message;
 import dkvs.server.util.Configuration;
 
 import java.io.IOException;
+import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketAddress;
@@ -18,7 +19,8 @@ public class ConnectionManager extends Thread {
 
     public ConnectionManager(Configuration configuration, NodeThread thread) throws IOException {
         this.thread = thread;
-        serverSocket = new ServerSocket(configuration.ports[configuration.number]);
+        serverSocket = new ServerSocket();
+        serverSocket.bind(new InetSocketAddress(configuration.hosts[configuration.number], configuration.ports[configuration.number]));
     }
 
     @Override

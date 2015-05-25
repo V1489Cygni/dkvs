@@ -14,8 +14,7 @@ public class Main {
         } else {
             try {
                 Configuration configuration = new Configuration("dkvs.properties", Integer.parseInt(args[0]) - 1);
-                NodeThread thread = new NodeThread(configuration);
-                thread.start();
+                new NodeThread(configuration).start();
             } catch (NumberFormatException e) {
                 System.err.println("Error: Unrecognized node number!");
             } catch (ParseException | FileNotFoundException e) {

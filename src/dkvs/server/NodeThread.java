@@ -37,6 +37,9 @@ public class NodeThread extends Thread {
         rsm = new RSM(configuration);
         state = new State();
         state.commitNext = rsm.size();
+        if (configuration.number == 0) {
+            state.state = 2;
+        }
     }
 
     public void add(Message message) {
@@ -140,6 +143,9 @@ public class NodeThread extends Thread {
                 } else {
                     sendVerbose(new ClientServerResponse(request.address, request.operation, false, "Unknown leader", request.redirections));
                 }
+                return;
+            default:
+                throw new AssertionError();
         }
     }
 

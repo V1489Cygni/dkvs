@@ -24,7 +24,8 @@ import java.util.Scanner;
 public class NodeThread extends Thread {
     private final Configuration configuration;
     private final ConnectionManager manager;
-    private final Queue<Message> queue = new ArrayDeque<>();
+    private final Queue<Message> input = new ArrayDeque<>();
+    private final Queue<Message> output = new ArrayDeque<>();
 
     private final RSM rsm;
     private final State state;
@@ -43,35 +44,33 @@ public class NodeThread extends Thread {
     }
 
     public void add(Message message) {
-        synchronized (queue) {
-            queue.add(message);
-            queue.notify();
+        synchronized (input) {
+            input.add(message);
+            input.notify();
+        }
+    }
+
+    public Message get() throws InterruptedException {
+        while (true) {
+            synchronized (output) {
+                if (!output.isEmpty()) {
+                    return output.poll();
+                }
+                output.wait();
+            }
         }
     }
 
     private Message getMessage() throws InterruptedException {
         int timeout = getTimeout();
         while (true) {
-            synchronized (queue) {
-                if (!queue.isEmpty()) {
-                    return queue.poll();
-                } else if (System.currentTimeMillis() - state.lastMessageTime > timeout) {
+            synchronized (input) {
+                if (!input.isEmpty()) {
+                    return input.poll();
+                } else if (System.currentTimeMillis() - state.lastMessageTime >= timeout) {
                     return null;
                 } else {
-                    new Thread(() -> {
-                        long t = System.currentTimeMillis();
-                        while (System.currentTimeMillis() - t < timeout) {
-                            try {
-                                Thread.sleep(timeout - (System.currentTimeMillis() - t));
-                            } catch (InterruptedException e) {
-                                return;
-                            }
-                        }
-                        synchronized (queue) {
-                            queue.notify();
-                        }
-                    }).start();
-                    queue.wait();
+                    input.wait(timeout - (System.currentTimeMillis() - state.lastMessageTime));
                 }
             }
         }
@@ -308,7 +307,10 @@ public class NodeThread extends Thread {
 
     private void sendVerbose(Message message) {
         System.out.println(getStatus() + " Sending message (" + message.address + "): " + message.prettyPrint());
-        manager.send(message);
+        synchronized (output) {
+            output.add(message);
+            output.notify();
+        }
     }
 
     private String getStatus() {
